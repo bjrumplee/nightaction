@@ -190,8 +190,17 @@ class NightActionServer:
 
     async def handle_client(self, websocket, path):
         """Handle individual client WebSocket connection"""
-        remote_address = websocket.remote_address
-        print(f"\n[*] WebSocket connection from {remote_address[0]}:{remote_address[1]}")
+        # Get remote address - handle proxy scenarios
+        try:
+            remote_address = websocket.remote_address
+            remote_ip = remote_address[0] if remote_address else "unknown"
+            remote_port = remote_address[1] if remote_address else 0
+        except:
+            remote_ip = "proxied"
+            remote_port = 0
+            remote_address = (remote_ip, remote_port)
+
+        print(f"\n[*] WebSocket connection from {remote_ip}:{remote_port}")
         session = None
 
         try:
@@ -200,7 +209,11 @@ class NightActionServer:
                 encoding=serialization.Encoding.PEM,
                 format=serialization.PublicFormat.SubjectPublicKeyInfo
             )
-            await websocket.send(public_pem.decode())
+            try:
+                await websocket.send(public_pem.decode())
+            except Exception as e:
+                print(f"[-] Error sending public key: {e}")
+                raise
 
             # Step 2: Receive encrypted authentication data
             encrypted_auth = await websocket.recv()
@@ -235,7 +248,7 @@ class NightActionServer:
                 encrypted_welcome = self._aes_encrypt(welcome_msg, session_key)
                 await websocket.send(encrypted_welcome)
 
-                print(f"[+] Agent authenticated: {codename} from {remote_address[0]}")
+                print(f"[+] Agent authenticated: {codename} from {remote_ip}")
                 session.add_message("SYSTEM", f"{codename} connected")
 
                 # Start send task
@@ -258,12 +271,14 @@ class NightActionServer:
                 })
                 encrypted_error = self._aes_encrypt(error_msg, session_key)
                 await websocket.send(encrypted_error)
-                print(f"[-] Authentication failed from {remote_address[0]}")
+                print(f"[-] Authentication failed from {remote_ip}")
 
         except websockets.exceptions.ConnectionClosed:
             pass
         except Exception as e:
-            print(f"[-] Error handling client {remote_address[0]}: {e}")
+            print(f"[-] Error handling client {remote_ip}: {e}")
+            import traceback
+            traceback.print_exc()
         finally:
             # Clean up session and purge chat history
             if session:
