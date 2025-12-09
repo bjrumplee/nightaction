@@ -188,7 +188,7 @@ class NightActionServer:
         except Exception as e:
             return None
 
-    async def handle_client(self, websocket, path):
+    async def handle_client(self, websocket):
         """Handle individual client WebSocket connection"""
         # Get remote address - handle proxy scenarios
         try:
