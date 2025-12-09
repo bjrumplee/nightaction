@@ -371,25 +371,43 @@ class NightActionServer:
         """Handle individual client WebSocket connection"""
         # Get real client IP from proxy headers (X-Forwarded-For or X-Real-IP)
         try:
-            # Check for real IP in headers (set by NGINX)
-            headers = websocket.request_headers if hasattr(websocket, 'request_headers') else {}
+            # websockets library provides request_headers as a Headers object
+            remote_ip = "unknown"
 
-            # Try X-Forwarded-For first (contains real client IP)
-            if 'X-Forwarded-For' in headers:
-                # X-Forwarded-For can have multiple IPs, first one is the real client
-                forwarded_for = headers['X-Forwarded-For']
-                remote_ip = forwarded_for.split(',')[0].strip()
-            # Try X-Real-IP as fallback
-            elif 'X-Real-IP' in headers:
-                remote_ip = headers['X-Real-IP']
+            if hasattr(websocket, 'request_headers'):
+                headers = websocket.request_headers
+
+                # Try different header variations (case-insensitive)
+                # Check X-Forwarded-For first (contains real client IP from Cloudflare)
+                if 'x-forwarded-for' in headers:
+                    forwarded_for = headers['x-forwarded-for']
+                    # X-Forwarded-For can have multiple IPs (client, proxy1, proxy2, ...)
+                    # First IP is the real client
+                    remote_ip = forwarded_for.split(',')[0].strip()
+                elif 'X-Forwarded-For' in headers:
+                    forwarded_for = headers['X-Forwarded-For']
+                    remote_ip = forwarded_for.split(',')[0].strip()
+                # Try X-Real-IP as fallback
+                elif 'x-real-ip' in headers:
+                    remote_ip = headers['x-real-ip']
+                elif 'X-Real-IP' in headers:
+                    remote_ip = headers['X-Real-IP']
+                else:
+                    # No proxy headers found, use direct connection IP
+                    remote_address = websocket.remote_address
+                    remote_ip = remote_address[0] if remote_address else "unknown"
+
+                    # Debug: print available headers to see what we're getting
+                    print(f"[DEBUG] Available headers: {list(headers.keys())}")
             else:
-                # No proxy headers, use direct connection IP
+                # Fallback to remote_address if no headers available
                 remote_address = websocket.remote_address
                 remote_ip = remote_address[0] if remote_address else "unknown"
 
             remote_port = 0  # Port not meaningful through proxy
             remote_address = (remote_ip, remote_port)
-        except:
+        except Exception as e:
+            print(f"[DEBUG] Error getting client IP: {e}")
             remote_ip = "unknown"
             remote_port = 0
             remote_address = (remote_ip, remote_port)
