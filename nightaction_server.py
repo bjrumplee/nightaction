@@ -387,6 +387,43 @@ class NightActionServer:
         print("Commands: 'back' to return | 'list' to show agents | Type message to send")
         print("="*70 + "\n")
 
+    def _monitor_messages(self, displayed_count):
+        """Background thread to display incoming messages in real-time"""
+        import sys
+
+        while self.ui_running:
+            try:
+                time.sleep(0.1)  # Check every 100ms
+
+                if self.selected_agent and self.selected_agent in self.sessions:
+                    session = self.sessions[self.selected_agent]
+
+                    # Initialize message counter for this session if needed
+                    if self.selected_agent not in displayed_count:
+                        displayed_count[self.selected_agent] = len(session.chat_history)
+
+                    # Display any new messages since last check
+                    current_count = len(session.chat_history)
+                    if current_count > displayed_count[self.selected_agent]:
+                        # Move cursor to beginning of line and clear it
+                        sys.stdout.write('\r\033[K')
+
+                        # Display all new messages
+                        for i in range(displayed_count[self.selected_agent], current_count):
+                            timestamp, sender, message = session.chat_history[i]
+                            if sender == session.codename:
+                                print(f"[{timestamp}] {sender}: {message}")
+
+                        # Update displayed count
+                        displayed_count[self.selected_agent] = current_count
+
+                        # Redraw prompt
+                        sys.stdout.write(f"[{session.codename}]> ")
+                        sys.stdout.flush()
+
+            except Exception as e:
+                pass
+
     def user_interface(self):
         """Interactive UI for server operator"""
         print("\n" + "="*70)
@@ -399,20 +436,18 @@ class NightActionServer:
         print("  quit          - Shutdown server")
         print("="*70 + "\n")
 
+        # Track displayed messages per session
+        displayed_count = {}
+
+        # Start message monitoring thread
+        monitor_thread = threading.Thread(target=self._monitor_messages, args=(displayed_count,), daemon=True)
+        monitor_thread.start()
+
         while self.ui_running:
             try:
                 # Show prompt based on current state
                 if self.selected_agent and self.selected_agent in self.sessions:
                     session = self.sessions[self.selected_agent]
-
-                    # Check for new messages
-                    if session.chat_history:
-                        last_msg = session.chat_history[-1]
-                        if last_msg[1] == session.codename:
-                            # New message from agent - display it
-                            timestamp, sender, message = last_msg
-                            print(f"\r[{timestamp}] {sender}: {message}")
-
                     user_input = input(f"[{session.codename}]> ").strip()
 
                     if user_input.lower() == 'back':
