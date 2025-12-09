@@ -141,6 +141,185 @@ class NightActionServer:
         conn.close()
         return result[0] if result else None
 
+    def add_agent(self, code_words, codename):
+        """Add a new agent with their code and codename"""
+        if len(code_words) != 4:
+            print("[-] Error: Code must be exactly 4 words")
+            return False
+
+        code_hash = self._hash_code(code_words)
+
+        try:
+            conn = sqlite3.connect(self.db_path)
+            cursor = conn.cursor()
+            cursor.execute(
+                'INSERT INTO agents (code_hash, codename) VALUES (?, ?)',
+                (code_hash, codename)
+            )
+            conn.commit()
+            conn.close()
+            print(f"[+] Agent added: {codename}")
+            print(f"    Code: {' '.join(code_words)}")
+            return True
+        except sqlite3.IntegrityError:
+            print(f"[-] Code already exists in database")
+            return False
+
+    def list_all_agents(self):
+        """List all agents in database"""
+        conn = sqlite3.connect(self.db_path)
+        cursor = conn.cursor()
+        cursor.execute('''
+            SELECT id, codename, active, created_at, last_used
+            FROM agents
+            ORDER BY id
+        ''')
+        agents = cursor.fetchall()
+        conn.close()
+
+        if not agents:
+            print("\n[*] No agents in database")
+            return
+
+        print("\n" + "="*90)
+        print(f"{'ID':<5} {'CODENAME':<20} {'STATUS':<10} {'CREATED':<20} {'LAST USED':<20}")
+        print("="*90)
+
+        for agent in agents:
+            agent_id, codename, active, created_at, last_used = agent
+            status = "ACTIVE" if active else "INACTIVE"
+            last_used_str = last_used if last_used else "Never"
+            print(f"{agent_id:<5} {codename:<20} {status:<10} {created_at:<20} {last_used_str:<20}")
+
+        print("="*90 + "\n")
+
+    def deactivate_agent(self, agent_id):
+        """Deactivate an agent"""
+        conn = sqlite3.connect(self.db_path)
+        cursor = conn.cursor()
+        cursor.execute('SELECT codename FROM agents WHERE id = ?', (agent_id,))
+        result = cursor.fetchone()
+
+        if not result:
+            print(f"[-] Agent with ID {agent_id} not found")
+            conn.close()
+            return False
+
+        cursor.execute('UPDATE agents SET active = 0 WHERE id = ?', (agent_id,))
+        conn.commit()
+        conn.close()
+        print(f"[+] Agent deactivated: {result[0]} (ID: {agent_id})")
+        return True
+
+    def activate_agent(self, agent_id):
+        """Activate an agent"""
+        conn = sqlite3.connect(self.db_path)
+        cursor = conn.cursor()
+        cursor.execute('SELECT codename FROM agents WHERE id = ?', (agent_id,))
+        result = cursor.fetchone()
+
+        if not result:
+            print(f"[-] Agent with ID {agent_id} not found")
+            conn.close()
+            return False
+
+        cursor.execute('UPDATE agents SET active = 1 WHERE id = ?', (agent_id,))
+        conn.commit()
+        conn.close()
+        print(f"[+] Agent activated: {result[0]} (ID: {agent_id})")
+        return True
+
+    def delete_agent(self, agent_id):
+        """Delete an agent permanently"""
+        conn = sqlite3.connect(self.db_path)
+        cursor = conn.cursor()
+        cursor.execute('SELECT codename FROM agents WHERE id = ?', (agent_id,))
+        result = cursor.fetchone()
+
+        if not result:
+            print(f"[-] Agent with ID {agent_id} not found")
+            conn.close()
+            return False
+
+        confirm = input(f"[!] Delete agent '{result[0]}'? Type 'yes' to confirm: ")
+        if confirm.lower() != 'yes':
+            print("[*] Deletion cancelled")
+            conn.close()
+            return False
+
+        cursor.execute('DELETE FROM agents WHERE id = ?', (agent_id,))
+        conn.commit()
+        conn.close()
+        print(f"[+] Agent deleted: {result[0]} (ID: {agent_id})")
+        return True
+
+    def manage_agents_menu(self):
+        """Interactive agent management menu"""
+        while True:
+            print("\n" + "="*70)
+            print("AGENT MANAGEMENT")
+            print("="*70)
+            print("1. Add new agent")
+            print("2. List all agents")
+            print("3. Deactivate agent")
+            print("4. Activate agent")
+            print("5. Delete agent")
+            print("6. Back to main menu")
+            print("="*70 + "\n")
+
+            choice = input("Select option: ").strip()
+
+            if choice == '1':
+                print("\n[*] Add New Agent")
+                codename = input("Codename: ").strip().upper()
+                if not codename:
+                    print("[-] Codename cannot be empty")
+                    continue
+
+                print("Enter 4-word authentication code:")
+                code_words = []
+                for i in range(1, 5):
+                    word = input(f"  Word {i}: ").strip()
+                    if not word:
+                        print("[-] Word cannot be empty")
+                        break
+                    code_words.append(word.upper())
+
+                if len(code_words) == 4:
+                    self.add_agent(code_words, codename)
+
+            elif choice == '2':
+                self.list_all_agents()
+
+            elif choice == '3':
+                self.list_all_agents()
+                agent_id = input("Enter agent ID to deactivate: ").strip()
+                try:
+                    self.deactivate_agent(int(agent_id))
+                except ValueError:
+                    print("[-] Invalid agent ID")
+
+            elif choice == '4':
+                self.list_all_agents()
+                agent_id = input("Enter agent ID to activate: ").strip()
+                try:
+                    self.activate_agent(int(agent_id))
+                except ValueError:
+                    print("[-] Invalid agent ID")
+
+            elif choice == '5':
+                self.list_all_agents()
+                agent_id = input("Enter agent ID to delete: ").strip()
+                try:
+                    self.delete_agent(int(agent_id))
+                except ValueError:
+                    print("[-] Invalid agent ID")
+
+            elif choice == '6':
+                break
+            else:
+                print("[-] Invalid option")
+
     def _aes_encrypt(self, plaintext, key):
         """Encrypt data using AES-256-GCM"""
         iv = os.urandom(12)
@@ -190,17 +369,32 @@ class NightActionServer:
 
     async def handle_client(self, websocket):
         """Handle individual client WebSocket connection"""
-        # Get remote address - handle proxy scenarios
+        # Get real client IP from proxy headers (X-Forwarded-For or X-Real-IP)
         try:
-            remote_address = websocket.remote_address
-            remote_ip = remote_address[0] if remote_address else "unknown"
-            remote_port = remote_address[1] if remote_address else 0
+            # Check for real IP in headers (set by NGINX)
+            headers = websocket.request_headers if hasattr(websocket, 'request_headers') else {}
+
+            # Try X-Forwarded-For first (contains real client IP)
+            if 'X-Forwarded-For' in headers:
+                # X-Forwarded-For can have multiple IPs, first one is the real client
+                forwarded_for = headers['X-Forwarded-For']
+                remote_ip = forwarded_for.split(',')[0].strip()
+            # Try X-Real-IP as fallback
+            elif 'X-Real-IP' in headers:
+                remote_ip = headers['X-Real-IP']
+            else:
+                # No proxy headers, use direct connection IP
+                remote_address = websocket.remote_address
+                remote_ip = remote_address[0] if remote_address else "unknown"
+
+            remote_port = 0  # Port not meaningful through proxy
+            remote_address = (remote_ip, remote_port)
         except:
-            remote_ip = "proxied"
+            remote_ip = "unknown"
             remote_port = 0
             remote_address = (remote_ip, remote_port)
 
-        print(f"\n[*] WebSocket connection from {remote_ip}:{remote_port}")
+        print(f"\n[*] WebSocket connection from {remote_ip}")
         session = None
 
         try:
@@ -360,7 +554,9 @@ class NightActionServer:
                 duration_str = str(duration).split('.')[0]  # Remove microseconds
 
                 marker = ">>>" if websocket == self.selected_agent else "   "
-                print(f"{marker} {idx:<4} {session.codename:<15} {session.address[0]:<20} {duration_str:<20}")
+                # Show just IP, not port (port is 0 for proxied connections)
+                ip_display = session.address[0]
+                print(f"{marker} {idx:<4} {session.codename:<15} {ip_display:<20} {duration_str:<20}")
                 agents.append((idx, websocket, session))
 
             print("="*70 + "\n")
@@ -432,6 +628,7 @@ class NightActionServer:
         print("Commands:")
         print("  list          - Show active agents")
         print("  select <num>  - Select agent to communicate with")
+        print("  agents        - Manage agent database")
         print("  back          - Return to main menu")
         print("  quit          - Shutdown server")
         print("="*70 + "\n")
@@ -453,6 +650,17 @@ class NightActionServer:
                     if user_input.lower() == 'back':
                         self.selected_agent = None
                         print("\n[*] Returned to main menu\n")
+                        # Redisplay command menu
+                        print("="*70)
+                        print("SERVER CONTROL PANEL")
+                        print("="*70)
+                        print("Commands:")
+                        print("  list          - Show active agents")
+                        print("  select <num>  - Select agent to communicate with")
+                        print("  agents        - Manage agent database")
+                        print("  back          - Return to main menu")
+                        print("  quit          - Shutdown server")
+                        print("="*70 + "\n")
                         continue
                     elif user_input.lower() == 'list':
                         self.list_active_agents()
@@ -480,13 +688,27 @@ class NightActionServer:
                         except (ValueError, IndexError):
                             print("[-] Usage: select <number>")
 
+                    elif user_input.lower() == 'agents':
+                        self.manage_agents_menu()
+                        # Redisplay menu after returning from agent management
+                        print("\n" + "="*70)
+                        print("SERVER CONTROL PANEL")
+                        print("="*70)
+                        print("Commands:")
+                        print("  list          - Show active agents")
+                        print("  select <num>  - Select agent to communicate with")
+                        print("  agents        - Manage agent database")
+                        print("  back          - Return to main menu")
+                        print("  quit          - Shutdown server")
+                        print("="*70 + "\n")
+
                     elif user_input.lower() == 'quit':
                         print("\n[*] Shutting down server...")
                         self.ui_running = False
                         break
 
                     elif user_input:
-                        print("[-] Unknown command. Type 'list' to see agents or 'select <num>' to talk to an agent")
+                        print("[-] Unknown command. Type 'list', 'agents', 'select <num>', or 'quit'")
 
             except KeyboardInterrupt:
                 print("\n[*] Use 'quit' to shutdown or 'back' to return to menu")

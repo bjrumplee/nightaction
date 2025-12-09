@@ -152,7 +152,7 @@ class NightActionClient:
                     break
 
                 # Display message from server
-                print(f"\r[SERVER]: {decrypted_msg}")
+                print(f"\r[NIGHT ACTION]: {decrypted_msg}")
                 print(f"[{self.codename}]> ", end='', flush=True)
 
             except websockets.exceptions.ConnectionClosed:
