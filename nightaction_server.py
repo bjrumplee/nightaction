@@ -1,10 +1,11 @@
 #!/usr/bin/env python3
 """
-NightAction Server
-Secure authentication server for covert communications with multi-agent support
+NightAction Server - WebSocket Version
+Secure authentication server for covert communications with Cloudflare compatibility
 """
 
-import socket
+import asyncio
+import websockets
 import threading
 import json
 import base64
@@ -22,11 +23,11 @@ from cryptography.hazmat.backends import default_backend
 
 class AgentSession:
     """Represents an active agent connection"""
-    def __init__(self, codename, address, session_key, client_socket):
+    def __init__(self, codename, address, session_key, websocket):
         self.codename = codename
         self.address = address
         self.session_key = session_key
-        self.client_socket = client_socket
+        self.websocket = websocket
         self.message_queue = queue.Queue()  # Server->client messages
         self.chat_history = []  # List of tuples: (timestamp, sender, message)
         self.connected_at = datetime.now()
@@ -42,9 +43,9 @@ class NightActionServer:
         self.host = host
         self.port = port
         self.db_path = db_path
-        self.sessions = {}  # address -> AgentSession
+        self.sessions = {}  # websocket -> AgentSession
         self.sessions_lock = threading.Lock()
-        self.selected_agent = None  # Currently selected agent address
+        self.selected_agent = None  # Currently selected agent websocket
         self.ui_running = True
 
         # Generate or load RSA keys
@@ -187,9 +188,10 @@ class NightActionServer:
         except Exception as e:
             return None
 
-    def handle_client(self, client_socket, address):
-        """Handle individual client connection"""
-        print(f"\n[*] Connection from {address[0]}:{address[1]}")
+    async def handle_client(self, websocket, path):
+        """Handle individual client WebSocket connection"""
+        remote_address = websocket.remote_address
+        print(f"\n[*] WebSocket connection from {remote_address[0]}:{remote_address[1]}")
         session = None
 
         try:
@@ -198,15 +200,15 @@ class NightActionServer:
                 encoding=serialization.Encoding.PEM,
                 format=serialization.PublicFormat.SubjectPublicKeyInfo
             )
-            client_socket.send(public_pem)
+            await websocket.send(public_pem.decode())
 
             # Step 2: Receive encrypted authentication data
-            encrypted_auth = client_socket.recv(4096).decode()
+            encrypted_auth = await websocket.recv()
 
             # Step 3: Decrypt with RSA private key
             decrypted_data = self._rsa_decrypt(encrypted_auth)
             if not decrypted_data:
-                client_socket.send(b"AUTH_FAILED")
+                await websocket.send("AUTH_FAILED")
                 return
 
             # Parse authentication data
@@ -219,10 +221,10 @@ class NightActionServer:
 
             if codename:
                 # Create session
-                session = AgentSession(codename, address, session_key, client_socket)
+                session = AgentSession(codename, remote_address, session_key, websocket)
 
                 with self.sessions_lock:
-                    self.sessions[address] = session
+                    self.sessions[websocket] = session
 
                 # Send encrypted welcome message
                 welcome_msg = json.dumps({
@@ -231,28 +233,23 @@ class NightActionServer:
                     'codename': codename
                 })
                 encrypted_welcome = self._aes_encrypt(welcome_msg, session_key)
-                client_socket.send(encrypted_welcome.encode())
+                await websocket.send(encrypted_welcome)
 
-                print(f"[+] Agent authenticated: {codename} from {address[0]}")
+                print(f"[+] Agent authenticated: {codename} from {remote_address[0]}")
                 session.add_message("SYSTEM", f"{codename} connected")
 
-                # Start threads for this client
-                receive_thread = threading.Thread(
-                    target=self._receive_from_client,
-                    args=(session,),
-                    daemon=True
-                )
-                send_thread = threading.Thread(
-                    target=self._send_to_client,
-                    args=(session,),
-                    daemon=True
-                )
+                # Start send task
+                send_task = asyncio.create_task(self._send_to_client(session))
 
-                receive_thread.start()
-                send_thread.start()
+                # Receive messages
+                await self._receive_from_client(session)
 
-                # Keep connection alive
-                receive_thread.join()
+                # Cancel send task when receive ends
+                send_task.cancel()
+                try:
+                    await send_task
+                except asyncio.CancelledError:
+                    pass
 
             else:
                 error_msg = json.dumps({
@@ -260,37 +257,32 @@ class NightActionServer:
                     'message': 'Invalid authentication code'
                 })
                 encrypted_error = self._aes_encrypt(error_msg, session_key)
-                client_socket.send(encrypted_error.encode())
-                print(f"[-] Authentication failed from {address[0]}")
+                await websocket.send(encrypted_error)
+                print(f"[-] Authentication failed from {remote_address[0]}")
 
+        except websockets.exceptions.ConnectionClosed:
+            pass
         except Exception as e:
-            print(f"[-] Error handling client {address[0]}: {e}")
+            print(f"[-] Error handling client {remote_address[0]}: {e}")
         finally:
             # Clean up session and purge chat history
             if session:
                 session.active = False
                 with self.sessions_lock:
-                    if address in self.sessions:
+                    if websocket in self.sessions:
                         print(f"\n[*] {session.codename} disconnected - PURGING CHAT HISTORY")
                         # Clear chat history (burn after reading)
                         session.chat_history.clear()
-                        del self.sessions[address]
+                        del self.sessions[websocket]
                         # If this was the selected agent, deselect
-                        if self.selected_agent == address:
+                        if self.selected_agent == websocket:
                             self.selected_agent = None
 
-            try:
-                client_socket.close()
-            except:
-                pass
-
-    def _receive_from_client(self, session):
+    async def _receive_from_client(self, session):
         """Receive messages from client"""
         while session.active:
             try:
-                encrypted_msg = session.client_socket.recv(4096).decode()
-                if not encrypted_msg:
-                    break
+                encrypted_msg = await session.websocket.recv()
 
                 decrypted_msg = self._aes_decrypt(encrypted_msg, session.session_key)
                 if not decrypted_msg:
@@ -303,31 +295,36 @@ class NightActionServer:
                 if decrypted_msg.strip().upper() == 'DISCONNECT':
                     goodbye_msg = f"Goodbye {session.codename}. Stay safe."
                     encrypted_goodbye = self._aes_encrypt(goodbye_msg, session.session_key)
-                    session.client_socket.send(encrypted_goodbye.encode())
+                    await session.websocket.send(encrypted_goodbye)
                     break
 
+            except websockets.exceptions.ConnectionClosed:
+                break
             except Exception as e:
                 break
 
         session.active = False
 
-    def _send_to_client(self, session):
+    async def _send_to_client(self, session):
         """Send queued messages to client"""
         while session.active:
             try:
-                # Wait for message in queue (with timeout to check active status)
+                # Check queue with timeout
                 try:
-                    message = session.message_queue.get(timeout=0.5)
+                    message = session.message_queue.get(timeout=0.1)
                 except queue.Empty:
+                    await asyncio.sleep(0.1)
                     continue
 
                 # Encrypt and send
                 encrypted_msg = self._aes_encrypt(message, session.session_key)
-                session.client_socket.send(encrypted_msg.encode())
+                await session.websocket.send(encrypted_msg)
 
                 # Add to chat history
                 session.add_message("SERVER", message)
 
+            except websockets.exceptions.ConnectionClosed:
+                break
             except Exception as e:
                 break
 
@@ -343,13 +340,13 @@ class NightActionServer:
             print("="*70)
 
             agents = []
-            for idx, (address, session) in enumerate(self.sessions.items(), 1):
+            for idx, (websocket, session) in enumerate(self.sessions.items(), 1):
                 duration = datetime.now() - session.connected_at
                 duration_str = str(duration).split('.')[0]  # Remove microseconds
 
-                marker = ">>>" if address == self.selected_agent else "   "
-                print(f"{marker} {idx:<4} {session.codename:<15} {address[0]:<20} {duration_str:<20}")
-                agents.append((idx, address, session))
+                marker = ">>>" if websocket == self.selected_agent else "   "
+                print(f"{marker} {idx:<4} {session.codename:<15} {session.address[0]:<20} {duration_str:<20}")
+                agents.append((idx, websocket, session))
 
             print("="*70 + "\n")
             return agents
@@ -425,8 +422,8 @@ class NightActionServer:
                             agents = self.list_active_agents()
 
                             if 1 <= num <= len(agents):
-                                _, address, session = agents[num - 1]
-                                self.selected_agent = address
+                                _, websocket, session = agents[num - 1]
+                                self.selected_agent = websocket
                                 self.display_chat(session)
                             else:
                                 print(f"[-] Invalid agent number: {num}")
@@ -447,44 +444,37 @@ class NightActionServer:
                 print(f"[-] Error: {e}")
 
     def start(self):
-        """Start the server"""
-        server_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        server_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-        server_socket.bind((self.host, self.port))
-        server_socket.listen(5)
-
+        """Start the WebSocket server"""
         print(f"""
 ╔═══════════════════════════════════════════╗
 ║         NIGHTACTION SERVER ACTIVE         ║
+║            (WebSocket Mode)               ║
 ╚═══════════════════════════════════════════╝
-[*] Listening on {self.host}:{self.port}
+[*] Listening on ws://{self.host}:{self.port}
+[*] Compatible with Cloudflare Proxy
 [*] Type 'list' to see active agents
 [*] Type 'select <num>' to talk to an agent
 [*] Type 'quit' to shutdown
 """)
 
-        # Start network listener thread
-        def accept_connections():
-            while self.ui_running:
-                try:
-                    server_socket.settimeout(1.0)
-                    try:
-                        client_socket, address = server_socket.accept()
-                        client_thread = threading.Thread(
-                            target=self.handle_client,
-                            args=(client_socket, address),
-                            daemon=True
-                        )
-                        client_thread.start()
-                    except socket.timeout:
-                        continue
-                except Exception as e:
-                    if self.ui_running:
-                        print(f"[-] Accept error: {e}")
-            server_socket.close()
+        # Start WebSocket server in a separate thread
+        def run_websocket_server():
+            loop = asyncio.new_event_loop()
+            asyncio.set_event_loop(loop)
 
-        network_thread = threading.Thread(target=accept_connections, daemon=True)
-        network_thread.start()
+            start_server = websockets.serve(
+                self.handle_client,
+                self.host,
+                self.port,
+                ping_interval=30,
+                ping_timeout=10
+            )
+
+            loop.run_until_complete(start_server)
+            loop.run_forever()
+
+        ws_thread = threading.Thread(target=run_websocket_server, daemon=True)
+        ws_thread.start()
 
         # Start UI in main thread
         try:
@@ -493,13 +483,13 @@ class NightActionServer:
             print("\n[*] Server shutting down...")
         finally:
             self.ui_running = False
-            time.sleep(1)  # Give threads time to cleanup
+            time.sleep(1)
             print("[*] Server stopped")
 
 def main():
     import argparse
 
-    parser = argparse.ArgumentParser(description='NightAction Server')
+    parser = argparse.ArgumentParser(description='NightAction Server (WebSocket)')
     parser.add_argument('--host', default='0.0.0.0', help='Host to bind to')
     parser.add_argument('--port', type=int, default=7777, help='Port to listen on')
     parser.add_argument('--db', default='nightaction.db', help='Database file path')

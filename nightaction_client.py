@@ -1,15 +1,14 @@
 #!/usr/bin/env python3
 """
-NightAction Client
-Secure client for covert communications with bidirectional support
+NightAction Client - WebSocket Version
+Secure client for covert communications with Cloudflare compatibility
 """
 
-import socket
+import asyncio
+import websockets
 import json
 import base64
 import os
-import threading
-import sys
 from cryptography.hazmat.primitives import hashes, serialization
 from cryptography.hazmat.primitives.asymmetric import padding
 from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
@@ -19,10 +18,9 @@ class NightActionClient:
     def __init__(self):
         self.session_key = None
         self.server_public_key = None
-        self.sock = None
+        self.websocket = None
         self.codename = None
         self.active = True
-        self.receive_thread = None
 
     def _aes_encrypt(self, plaintext, key):
         """Encrypt data using AES-256-GCM"""
@@ -71,19 +69,18 @@ class NightActionClient:
             print(f"[-] RSA encryption error: {e}")
             return None
 
-    def connect_and_authenticate(self, host, port, code_words):
-        """Connect to server and authenticate"""
+    async def connect_and_authenticate(self, uri, code_words):
+        """Connect to server and authenticate via WebSocket"""
         try:
-            # Connect to server
-            print(f"[*] Connecting to {host}:{port}...")
-            self.sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-            self.sock.connect((host, port))
-            print("[+] Connected to server")
+            # Connect to WebSocket server
+            print(f"[*] Connecting to {uri}...")
+            self.websocket = await websockets.connect(uri, ping_interval=30, ping_timeout=10)
+            print("[+] WebSocket connected")
 
             # Step 1: Receive server's public key
-            public_key_pem = self.sock.recv(4096)
+            public_key_pem = await self.websocket.recv()
             self.server_public_key = serialization.load_pem_public_key(
-                public_key_pem,
+                public_key_pem.encode(),
                 backend=default_backend()
             )
             print("[+] Received server public key")
@@ -103,11 +100,11 @@ class NightActionClient:
                 print("[-] Failed to encrypt authentication data")
                 return False
 
-            self.sock.send(encrypted_auth.encode())
+            await self.websocket.send(encrypted_auth)
             print("[*] Authentication request sent...")
 
             # Step 5: Receive response
-            encrypted_response = self.sock.recv(4096).decode()
+            encrypted_response = await self.websocket.recv()
             response = self._aes_decrypt(encrypted_response, self.session_key)
 
             if not response:
@@ -124,33 +121,29 @@ class NightActionClient:
                 print(f"\n[-] Authentication failed: {response_data['message']}")
                 return False
 
-        except ConnectionRefusedError:
-            print(f"[-] Connection refused. Is the server running at {host}:{port}?")
+        except websockets.exceptions.WebSocketException as e:
+            print(f"[-] WebSocket error: {e}")
             return False
         except Exception as e:
             print(f"[-] Connection error: {e}")
             return False
 
-    def send_message(self, message):
+    async def send_message(self, message):
         """Send encrypted message to server"""
         try:
             encrypted_msg = self._aes_encrypt(message, self.session_key)
-            self.sock.send(encrypted_msg.encode())
+            await self.websocket.send(encrypted_msg)
             return True
         except Exception as e:
             print(f"[-] Error sending message: {e}")
             self.active = False
             return False
 
-    def receive_messages(self):
+    async def receive_messages(self):
         """Continuously receive messages from server"""
         while self.active:
             try:
-                encrypted_msg = self.sock.recv(4096).decode()
-                if not encrypted_msg:
-                    print("\n[*] Server disconnected")
-                    self.active = False
-                    break
+                encrypted_msg = await self.websocket.recv()
 
                 decrypted_msg = self._aes_decrypt(encrypted_msg, self.session_key)
                 if not decrypted_msg:
@@ -162,29 +155,25 @@ class NightActionClient:
                 print(f"\r[SERVER]: {decrypted_msg}")
                 print(f"[{self.codename}]> ", end='', flush=True)
 
+            except websockets.exceptions.ConnectionClosed:
+                print("\n[*] Server disconnected")
+                self.active = False
+                break
             except Exception as e:
                 if self.active:
                     print(f"\n[-] Receive error: {e}")
                 self.active = False
                 break
 
-    def start_session(self):
-        """Start interactive session with bidirectional communication"""
-        print(f"""
-╔═══════════════════════════════════════════╗
-║      SECURE CHANNEL ESTABLISHED [{self.codename}]     ║
-╚═══════════════════════════════════════════╝
-Type your messages below. Type 'DISCONNECT' to exit.
-""")
+    async def send_user_input(self):
+        """Handle user input and send to server"""
+        loop = asyncio.get_event_loop()
 
-        # Start receive thread
-        self.receive_thread = threading.Thread(target=self.receive_messages, daemon=True)
-        self.receive_thread.start()
-
-        # Main thread handles user input
         while self.active:
             try:
-                message = input(f"[{self.codename}]> ").strip()
+                # Use run_in_executor to make input() non-blocking
+                message = await loop.run_in_executor(None, input, f"[{self.codename}]> ")
+                message = message.strip()
 
                 if not self.active:
                     break
@@ -193,7 +182,7 @@ Type your messages below. Type 'DISCONNECT' to exit.
                     continue
 
                 # Send message
-                if not self.send_message(message):
+                if not await self.send_message(message):
                     break
 
                 # Check for disconnect
@@ -201,10 +190,6 @@ Type your messages below. Type 'DISCONNECT' to exit.
                     print("[*] Disconnecting...")
                     break
 
-            except KeyboardInterrupt:
-                print("\n[*] Sending disconnect...")
-                self.send_message("DISCONNECT")
-                break
             except EOFError:
                 # Handle Ctrl+D
                 break
@@ -212,11 +197,40 @@ Type your messages below. Type 'DISCONNECT' to exit.
                 print(f"[-] Input error: {e}")
                 break
 
+        self.active = False
+
+    async def start_session(self):
+        """Start interactive session with bidirectional communication"""
+        print(f"""
+╔═══════════════════════════════════════════╗
+║      SECURE CHANNEL ESTABLISHED [{self.codename}]     ║
+╚═══════════════════════════════════════════╝
+Type your messages below. Type 'DISCONNECT' to exit.
+""")
+
+        # Create tasks for sending and receiving
+        receive_task = asyncio.create_task(self.receive_messages())
+        send_task = asyncio.create_task(self.send_user_input())
+
+        # Wait for either task to complete
+        done, pending = await asyncio.wait(
+            [receive_task, send_task],
+            return_when=asyncio.FIRST_COMPLETED
+        )
+
+        # Cancel pending tasks
+        for task in pending:
+            task.cancel()
+            try:
+                await task
+            except asyncio.CancelledError:
+                pass
+
         # Cleanup
         self.active = False
-        if self.sock:
+        if self.websocket:
             try:
-                self.sock.close()
+                await self.websocket.close()
             except:
                 pass
         print("[*] Connection closed")
@@ -227,32 +241,48 @@ def print_banner():
 ╔═══════════════════════════════════════════╗
 ║            NIGHTACTION CLIENT             ║
 ║        Secure Covert Communications       ║
+║            (WebSocket Mode)               ║
 ╚═══════════════════════════════════════════╝
 """
     print(banner)
 
-def main():
+async def main():
     print_banner()
 
     # Get target from user
     print("[*] Enter target server information")
     while True:
-        target = input("Target (IP or domain): ").strip()
+        target = input("Target (domain or IP): ").strip()
         if target:
             break
         print("[-] Target cannot be empty")
 
-    # Parse target (handle port if provided)
-    if ':' in target:
-        host, port_str = target.rsplit(':', 1)
-        try:
-            port = int(port_str)
-        except ValueError:
-            print("[-] Invalid port number, using default 7777")
-            port = 7777
+    # Parse target and build WebSocket URI
+    if target.startswith('ws://') or target.startswith('wss://'):
+        # Full URI provided
+        uri = target
     else:
-        host = target
-        port = 7777
+        # Just domain/IP provided - build URI
+        if ':' in target:
+            # Port specified
+            host, port = target.rsplit(':', 1)
+            # Assume wss:// for domains, ws:// for localhost/IPs
+            if 'localhost' in host or host.startswith('192.168.') or host.startswith('10.') or host.startswith('127.'):
+                protocol = 'ws'
+            else:
+                protocol = 'wss'  # Use secure WebSocket for domains (Cloudflare)
+            uri = f"{protocol}://{host}:{port}"
+        else:
+            # No port - use default 7777
+            # Assume wss:// for domains, ws:// for localhost/IPs
+            if 'localhost' in target or target.startswith('192.168.') or target.startswith('10.') or target.startswith('127.'):
+                protocol = 'ws'
+                uri = f"{protocol}://{target}:7777"
+            else:
+                protocol = 'wss'  # Use secure WebSocket for domains
+                uri = f"{protocol}://{target}"
+
+    print(f"[*] Using WebSocket URI: {uri}")
 
     # Get authentication code
     print("\n[*] Enter authentication code (4 words)")
@@ -269,10 +299,13 @@ def main():
 
     # Create client and connect
     client = NightActionClient()
-    if client.connect_and_authenticate(host, port, code_words):
-        client.start_session()
+    if await client.connect_and_authenticate(uri, code_words):
+        await client.start_session()
     else:
         print("[*] Connection terminated")
 
 if __name__ == '__main__':
-    main()
+    try:
+        asyncio.run(main())
+    except KeyboardInterrupt:
+        print("\n[*] Interrupted by user")

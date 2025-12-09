@@ -2,6 +2,8 @@
 
 Secure covert communications system with encrypted client-server authentication.
 
+**🚀 Now with WebSocket support for Cloudflare compatibility!**
+
 ## Features
 
 - **Military-grade encryption**: RSA-2048 + AES-256-GCM hybrid encryption
@@ -14,6 +16,8 @@ Secure covert communications system with encrypted client-server authentication.
 - **Agent selection UI**: Choose which agent to communicate with in real-time
 - **Session-based chat history**: View full conversation logs while connected
 - **Auto-purge on disconnect**: All chat history permanently deleted when client disconnects ("burn after reading")
+- **WebSocket transport**: Works through Cloudflare proxy, NGINX, and firewalls
+- **Cloudflare compatible**: DDoS protection, IP hiding, and global CDN support
 
 ## Security Architecture
 
@@ -182,15 +186,37 @@ SERVER> select 2
 
 **Security Note:** When an agent disconnects, ALL chat history is immediately purged from memory. This "burn after reading" feature ensures no forensic recovery of conversations.
 
+## Cloudflare Deployment
+
+NightAction uses **WebSocket transport** and works seamlessly through Cloudflare's proxy:
+
+**Client connects via:**
+```
+wss://nightaction.yourdomain.com
+```
+
+**Setup:**
+1. Enable Cloudflare proxy (orange cloud) for your domain
+2. Configure NGINX to proxy WebSocket connections
+3. Set Cloudflare SSL mode to "Flexible"
+4. Deploy and enjoy DDoS protection + IP hiding
+
+**See `CLOUDFLARE_SETUP.md` for complete guide.**
+
+**Security:** Even with Cloudflare proxy, all messages are **end-to-end encrypted** (RSA + AES-256). Cloudflare only sees encrypted WebSocket frames, not message content.
+
 ## File Structure
 
 ```
 nightaction/
-├── nightaction_server.py    # Server application
-├── nightaction_client.py    # Client application
+├── nightaction_server.py    # Server application (WebSocket)
+├── nightaction_client.py    # Client application (WebSocket)
 ├── manage_agents.py         # Agent management utility
 ├── requirements.txt         # Python dependencies
 ├── README.md               # This file
+├── CLOUDFLARE_SETUP.md     # Cloudflare deployment guide
+├── USAGE_GUIDE.md          # Operational manual
+├── QUICK_START.md          # 5-minute setup guide
 ├── nightaction.db          # SQLite database (generated)
 ├── server_private.pem      # Server RSA private key (generated)
 └── server_public.pem       # Server RSA public key (generated)
