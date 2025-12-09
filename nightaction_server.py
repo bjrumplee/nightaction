@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 NightAction Server
-Secure authentication server for covert communications
+Secure authentication server for covert communications with multi-agent support
 """
 
 import socket
@@ -11,18 +11,41 @@ import base64
 import sqlite3
 import hashlib
 import os
+import queue
+import time
+from datetime import datetime
 from pathlib import Path
 from cryptography.hazmat.primitives import hashes, serialization
 from cryptography.hazmat.primitives.asymmetric import rsa, padding
 from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
 from cryptography.hazmat.backends import default_backend
 
+class AgentSession:
+    """Represents an active agent connection"""
+    def __init__(self, codename, address, session_key, client_socket):
+        self.codename = codename
+        self.address = address
+        self.session_key = session_key
+        self.client_socket = client_socket
+        self.message_queue = queue.Queue()  # Server->client messages
+        self.chat_history = []  # List of tuples: (timestamp, sender, message)
+        self.connected_at = datetime.now()
+        self.active = True
+
+    def add_message(self, sender, message):
+        """Add message to chat history"""
+        timestamp = datetime.now().strftime("%H:%M:%S")
+        self.chat_history.append((timestamp, sender, message))
+
 class NightActionServer:
     def __init__(self, host='0.0.0.0', port=7777, db_path='nightaction.db'):
         self.host = host
         self.port = port
         self.db_path = db_path
-        self.sessions = {}  # Track active sessions
+        self.sessions = {}  # address -> AgentSession
+        self.sessions_lock = threading.Lock()
+        self.selected_agent = None  # Currently selected agent address
+        self.ui_running = True
 
         # Generate or load RSA keys
         self.private_key, self.public_key = self._load_or_generate_keys()
@@ -71,11 +94,10 @@ class NightActionServer:
         return private_key, public_key
 
     def _init_database(self):
-        """Initialize SQLite database with encryption"""
+        """Initialize SQLite database"""
         conn = sqlite3.connect(self.db_path)
         cursor = conn.cursor()
 
-        # Create agents table (codes are hashed for security)
         cursor.execute('''
             CREATE TABLE IF NOT EXISTS agents (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -96,25 +118,6 @@ class NightActionServer:
         code_string = ' '.join(code_words).upper()
         return hashlib.sha256(code_string.encode()).hexdigest()
 
-    def add_agent(self, code_words, codename):
-        """Add a new agent with their code and codename"""
-        code_hash = self._hash_code(code_words)
-
-        try:
-            conn = sqlite3.connect(self.db_path)
-            cursor = conn.cursor()
-            cursor.execute(
-                'INSERT INTO agents (code_hash, codename) VALUES (?, ?)',
-                (code_hash, codename)
-            )
-            conn.commit()
-            conn.close()
-            print(f"[+] Agent added: {codename}")
-            return True
-        except sqlite3.IntegrityError:
-            print(f"[-] Code already exists in database")
-            return False
-
     def verify_code(self, code_words):
         """Verify code and return codename if valid"""
         code_hash = self._hash_code(code_words)
@@ -128,7 +131,6 @@ class NightActionServer:
         result = cursor.fetchone()
 
         if result:
-            # Update last used timestamp
             cursor.execute(
                 'UPDATE agents SET last_used = CURRENT_TIMESTAMP WHERE code_hash = ?',
                 (code_hash,)
@@ -140,7 +142,7 @@ class NightActionServer:
 
     def _aes_encrypt(self, plaintext, key):
         """Encrypt data using AES-256-GCM"""
-        iv = os.urandom(12)  # GCM standard IV size
+        iv = os.urandom(12)
         cipher = Cipher(
             algorithms.AES(key),
             modes.GCM(iv),
@@ -148,8 +150,6 @@ class NightActionServer:
         )
         encryptor = cipher.encryptor()
         ciphertext = encryptor.update(plaintext.encode()) + encryptor.finalize()
-
-        # Return IV + tag + ciphertext (all needed for decryption)
         return base64.b64encode(iv + encryptor.tag + ciphertext).decode()
 
     def _aes_decrypt(self, encrypted_data, key):
@@ -169,7 +169,6 @@ class NightActionServer:
             plaintext = decryptor.update(ciphertext) + decryptor.finalize()
             return plaintext.decode()
         except Exception as e:
-            print(f"[-] Decryption error: {e}")
             return None
 
     def _rsa_decrypt(self, encrypted_data):
@@ -186,14 +185,12 @@ class NightActionServer:
             )
             return plaintext
         except Exception as e:
-            print(f"[-] RSA decryption error: {e}")
             return None
 
     def handle_client(self, client_socket, address):
         """Handle individual client connection"""
-        print(f"[*] Connection from {address[0]}:{address[1]}")
-        session_key = None
-        codename = None
+        print(f"\n[*] Connection from {address[0]}:{address[1]}")
+        session = None
 
         try:
             # Step 1: Send public key to client
@@ -212,7 +209,7 @@ class NightActionServer:
                 client_socket.send(b"AUTH_FAILED")
                 return
 
-            # Parse authentication data (session_key + 4 words)
+            # Parse authentication data
             auth_data = json.loads(decrypted_data.decode())
             session_key = base64.b64decode(auth_data['session_key'])
             code_words = auth_data['code_words']
@@ -221,6 +218,12 @@ class NightActionServer:
             codename = self.verify_code(code_words)
 
             if codename:
+                # Create session
+                session = AgentSession(codename, address, session_key, client_socket)
+
+                with self.sessions_lock:
+                    self.sessions[address] = session
+
                 # Send encrypted welcome message
                 welcome_msg = json.dumps({
                     'status': 'SUCCESS',
@@ -231,15 +234,26 @@ class NightActionServer:
                 client_socket.send(encrypted_welcome.encode())
 
                 print(f"[+] Agent authenticated: {codename} from {address[0]}")
+                session.add_message("SYSTEM", f"{codename} connected")
 
-                # Store session
-                self.sessions[address] = {
-                    'codename': codename,
-                    'session_key': session_key
-                }
+                # Start threads for this client
+                receive_thread = threading.Thread(
+                    target=self._receive_from_client,
+                    args=(session,),
+                    daemon=True
+                )
+                send_thread = threading.Thread(
+                    target=self._send_to_client,
+                    args=(session,),
+                    daemon=True
+                )
 
-                # Step 5: Enter secure communication mode
-                self._secure_communication(client_socket, address, session_key, codename)
+                receive_thread.start()
+                send_thread.start()
+
+                # Keep connection alive
+                receive_thread.join()
+
             else:
                 error_msg = json.dumps({
                     'status': 'FAILED',
@@ -252,44 +266,185 @@ class NightActionServer:
         except Exception as e:
             print(f"[-] Error handling client {address[0]}: {e}")
         finally:
-            if address in self.sessions:
-                del self.sessions[address]
-            client_socket.close()
-            print(f"[*] Connection closed: {address[0]}")
+            # Clean up session and purge chat history
+            if session:
+                session.active = False
+                with self.sessions_lock:
+                    if address in self.sessions:
+                        print(f"\n[*] {session.codename} disconnected - PURGING CHAT HISTORY")
+                        # Clear chat history (burn after reading)
+                        session.chat_history.clear()
+                        del self.sessions[address]
+                        # If this was the selected agent, deselect
+                        if self.selected_agent == address:
+                            self.selected_agent = None
 
-    def _secure_communication(self, client_socket, address, session_key, codename):
-        """Handle encrypted communication with authenticated client"""
-        print(f"[*] Entering secure communication mode with {codename}")
-
-        while True:
             try:
-                # Receive encrypted message
-                encrypted_msg = client_socket.recv(4096).decode()
+                client_socket.close()
+            except:
+                pass
+
+    def _receive_from_client(self, session):
+        """Receive messages from client"""
+        while session.active:
+            try:
+                encrypted_msg = session.client_socket.recv(4096).decode()
                 if not encrypted_msg:
                     break
 
-                # Decrypt message
-                decrypted_msg = self._aes_decrypt(encrypted_msg, session_key)
+                decrypted_msg = self._aes_decrypt(encrypted_msg, session.session_key)
                 if not decrypted_msg:
                     break
 
-                print(f"[{codename}]: {decrypted_msg}")
+                # Add to chat history
+                session.add_message(session.codename, decrypted_msg)
 
-                # Check for disconnect command
+                # Check for disconnect
                 if decrypted_msg.strip().upper() == 'DISCONNECT':
-                    goodbye_msg = f"Goodbye {codename}. Stay safe."
-                    encrypted_goodbye = self._aes_encrypt(goodbye_msg, session_key)
-                    client_socket.send(encrypted_goodbye.encode())
+                    goodbye_msg = f"Goodbye {session.codename}. Stay safe."
+                    encrypted_goodbye = self._aes_encrypt(goodbye_msg, session.session_key)
+                    session.client_socket.send(encrypted_goodbye.encode())
                     break
 
-                # Echo back (in real implementation, add your logic here)
-                response = f"Server received: {decrypted_msg}"
-                encrypted_response = self._aes_encrypt(response, session_key)
-                client_socket.send(encrypted_response.encode())
+            except Exception as e:
+                break
+
+        session.active = False
+
+    def _send_to_client(self, session):
+        """Send queued messages to client"""
+        while session.active:
+            try:
+                # Wait for message in queue (with timeout to check active status)
+                try:
+                    message = session.message_queue.get(timeout=0.5)
+                except queue.Empty:
+                    continue
+
+                # Encrypt and send
+                encrypted_msg = self._aes_encrypt(message, session.session_key)
+                session.client_socket.send(encrypted_msg.encode())
+
+                # Add to chat history
+                session.add_message("SERVER", message)
 
             except Exception as e:
-                print(f"[-] Communication error with {codename}: {e}")
                 break
+
+    def list_active_agents(self):
+        """List all active agents"""
+        with self.sessions_lock:
+            if not self.sessions:
+                print("\n[*] No active agents")
+                return []
+
+            print("\n" + "="*70)
+            print(f"{'#':<4} {'CODENAME':<15} {'IP ADDRESS':<20} {'CONNECTED':<20}")
+            print("="*70)
+
+            agents = []
+            for idx, (address, session) in enumerate(self.sessions.items(), 1):
+                duration = datetime.now() - session.connected_at
+                duration_str = str(duration).split('.')[0]  # Remove microseconds
+
+                marker = ">>>" if address == self.selected_agent else "   "
+                print(f"{marker} {idx:<4} {session.codename:<15} {address[0]:<20} {duration_str:<20}")
+                agents.append((idx, address, session))
+
+            print("="*70 + "\n")
+            return agents
+
+    def display_chat(self, session):
+        """Display chat history for selected agent"""
+        print("\n" + "="*70)
+        print(f"CONVERSATION WITH {session.codename} ({session.address[0]})")
+        print("="*70)
+
+        if not session.chat_history:
+            print("[No messages yet]")
+        else:
+            for timestamp, sender, message in session.chat_history:
+                if sender == "SYSTEM":
+                    print(f"[{timestamp}] *** {message} ***")
+                elif sender == "SERVER":
+                    print(f"[{timestamp}] YOU: {message}")
+                else:
+                    print(f"[{timestamp}] {sender}: {message}")
+
+        print("="*70)
+        print("Commands: 'back' to return | 'list' to show agents | Type message to send")
+        print("="*70 + "\n")
+
+    def user_interface(self):
+        """Interactive UI for server operator"""
+        print("\n" + "="*70)
+        print("SERVER CONTROL PANEL")
+        print("="*70)
+        print("Commands:")
+        print("  list          - Show active agents")
+        print("  select <num>  - Select agent to communicate with")
+        print("  back          - Return to main menu")
+        print("  quit          - Shutdown server")
+        print("="*70 + "\n")
+
+        while self.ui_running:
+            try:
+                # Show prompt based on current state
+                if self.selected_agent and self.selected_agent in self.sessions:
+                    session = self.sessions[self.selected_agent]
+
+                    # Check for new messages
+                    if session.chat_history:
+                        last_msg = session.chat_history[-1]
+                        if last_msg[1] == session.codename:
+                            # New message from agent - display it
+                            timestamp, sender, message = last_msg
+                            print(f"\r[{timestamp}] {sender}: {message}")
+
+                    user_input = input(f"[{session.codename}]> ").strip()
+
+                    if user_input.lower() == 'back':
+                        self.selected_agent = None
+                        print("\n[*] Returned to main menu\n")
+                        continue
+                    elif user_input.lower() == 'list':
+                        self.list_active_agents()
+                        continue
+                    elif user_input:
+                        # Send message to selected agent
+                        session.message_queue.put(user_input)
+                else:
+                    user_input = input("SERVER> ").strip()
+
+                    if user_input.lower() == 'list':
+                        self.list_active_agents()
+
+                    elif user_input.lower().startswith('select '):
+                        try:
+                            num = int(user_input.split()[1])
+                            agents = self.list_active_agents()
+
+                            if 1 <= num <= len(agents):
+                                _, address, session = agents[num - 1]
+                                self.selected_agent = address
+                                self.display_chat(session)
+                            else:
+                                print(f"[-] Invalid agent number: {num}")
+                        except (ValueError, IndexError):
+                            print("[-] Usage: select <number>")
+
+                    elif user_input.lower() == 'quit':
+                        print("\n[*] Shutting down server...")
+                        self.ui_running = False
+                        break
+
+                    elif user_input:
+                        print("[-] Unknown command. Type 'list' to see agents or 'select <num>' to talk to an agent")
+
+            except KeyboardInterrupt:
+                print("\n[*] Use 'quit' to shutdown or 'back' to return to menu")
+            except Exception as e:
+                print(f"[-] Error: {e}")
 
     def start(self):
         """Start the server"""
@@ -303,22 +458,43 @@ class NightActionServer:
 ║         NIGHTACTION SERVER ACTIVE         ║
 ╚═══════════════════════════════════════════╝
 [*] Listening on {self.host}:{self.port}
-[*] Press Ctrl+C to stop
+[*] Type 'list' to see active agents
+[*] Type 'select <num>' to talk to an agent
+[*] Type 'quit' to shutdown
 """)
 
+        # Start network listener thread
+        def accept_connections():
+            while self.ui_running:
+                try:
+                    server_socket.settimeout(1.0)
+                    try:
+                        client_socket, address = server_socket.accept()
+                        client_thread = threading.Thread(
+                            target=self.handle_client,
+                            args=(client_socket, address),
+                            daemon=True
+                        )
+                        client_thread.start()
+                    except socket.timeout:
+                        continue
+                except Exception as e:
+                    if self.ui_running:
+                        print(f"[-] Accept error: {e}")
+            server_socket.close()
+
+        network_thread = threading.Thread(target=accept_connections, daemon=True)
+        network_thread.start()
+
+        # Start UI in main thread
         try:
-            while True:
-                client_socket, address = server_socket.accept()
-                client_thread = threading.Thread(
-                    target=self.handle_client,
-                    args=(client_socket, address)
-                )
-                client_thread.daemon = True
-                client_thread.start()
+            self.user_interface()
         except KeyboardInterrupt:
             print("\n[*] Server shutting down...")
         finally:
-            server_socket.close()
+            self.ui_running = False
+            time.sleep(1)  # Give threads time to cleanup
+            print("[*] Server stopped")
 
 def main():
     import argparse

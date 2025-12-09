@@ -1,13 +1,15 @@
 #!/usr/bin/env python3
 """
 NightAction Client
-Secure client for covert communications
+Secure client for covert communications with bidirectional support
 """
 
 import socket
 import json
 import base64
 import os
+import threading
+import sys
 from cryptography.hazmat.primitives import hashes, serialization
 from cryptography.hazmat.primitives.asymmetric import padding
 from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
@@ -19,6 +21,8 @@ class NightActionClient:
         self.server_public_key = None
         self.sock = None
         self.codename = None
+        self.active = True
+        self.receive_thread = None
 
     def _aes_encrypt(self, plaintext, key):
         """Encrypt data using AES-256-GCM"""
@@ -49,7 +53,6 @@ class NightActionClient:
             plaintext = decryptor.update(ciphertext) + decryptor.finalize()
             return plaintext.decode()
         except Exception as e:
-            print(f"[-] Decryption error: {e}")
             return None
 
     def _rsa_encrypt(self, plaintext):
@@ -133,20 +136,40 @@ class NightActionClient:
         try:
             encrypted_msg = self._aes_encrypt(message, self.session_key)
             self.sock.send(encrypted_msg.encode())
-
-            # Receive response
-            encrypted_response = self.sock.recv(4096).decode()
-            if not encrypted_response:
-                return None
-
-            response = self._aes_decrypt(encrypted_response, self.session_key)
-            return response
+            return True
         except Exception as e:
             print(f"[-] Error sending message: {e}")
-            return None
+            self.active = False
+            return False
+
+    def receive_messages(self):
+        """Continuously receive messages from server"""
+        while self.active:
+            try:
+                encrypted_msg = self.sock.recv(4096).decode()
+                if not encrypted_msg:
+                    print("\n[*] Server disconnected")
+                    self.active = False
+                    break
+
+                decrypted_msg = self._aes_decrypt(encrypted_msg, self.session_key)
+                if not decrypted_msg:
+                    print("\n[-] Decryption error")
+                    self.active = False
+                    break
+
+                # Display message from server
+                print(f"\r[SERVER]: {decrypted_msg}")
+                print(f"[{self.codename}]> ", end='', flush=True)
+
+            except Exception as e:
+                if self.active:
+                    print(f"\n[-] Receive error: {e}")
+                self.active = False
+                break
 
     def start_session(self):
-        """Start interactive session"""
+        """Start interactive session with bidirectional communication"""
         print(f"""
 ╔═══════════════════════════════════════════╗
 ║      SECURE CHANNEL ESTABLISHED [{self.codename}]     ║
@@ -154,30 +177,48 @@ class NightActionClient:
 Type your messages below. Type 'DISCONNECT' to exit.
 """)
 
-        while True:
+        # Start receive thread
+        self.receive_thread = threading.Thread(target=self.receive_messages, daemon=True)
+        self.receive_thread.start()
+
+        # Main thread handles user input
+        while self.active:
             try:
                 message = input(f"[{self.codename}]> ").strip()
+
+                if not self.active:
+                    break
 
                 if not message:
                     continue
 
-                response = self.send_message(message)
-                if response:
-                    print(f"[SERVER]: {response}")
+                # Send message
+                if not self.send_message(message):
+                    break
 
+                # Check for disconnect
                 if message.upper() == 'DISCONNECT':
+                    print("[*] Disconnecting...")
                     break
 
             except KeyboardInterrupt:
                 print("\n[*] Sending disconnect...")
                 self.send_message("DISCONNECT")
                 break
+            except EOFError:
+                # Handle Ctrl+D
+                break
             except Exception as e:
-                print(f"[-] Session error: {e}")
+                print(f"[-] Input error: {e}")
                 break
 
+        # Cleanup
+        self.active = False
         if self.sock:
-            self.sock.close()
+            try:
+                self.sock.close()
+            except:
+                pass
         print("[*] Connection closed")
 
 def print_banner():

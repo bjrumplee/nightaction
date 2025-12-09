@@ -70,15 +70,36 @@ You should see:
 ╚═══════════════════════════════════════════╝
 ```
 
-## Step 5: Test It! (1 minute)
+## Step 5: Test Bidirectional Communication! (2 minutes)
 
-Type any message:
+### On Client:
+Type a message:
 ```
-[OSPREY]> Test message
-[SERVER]: Server received: Test message
+[OSPREY]> Status report requested
 ```
 
-Type `DISCONNECT` to exit.
+### On Server:
+You'll see the message arrive. Now select the agent and reply:
+```
+SERVER> list
+    1    OSPREY          192.168.1.50         0:00:30
+
+SERVER> select 1
+[OSPREY]> All systems operational. Ready for orders.
+```
+
+### On Client:
+The message appears in real-time:
+```
+[OSPREY]>
+[SERVER]: All systems operational. Ready for orders.
+[OSPREY]> Acknowledged
+```
+
+### Both Ways:
+Full two-way encrypted communication! Type `DISCONNECT` on client to exit.
+
+**Security Feature:** When client disconnects, ALL chat history is purged from server memory.
 
 ## Remote Connection Setup
 

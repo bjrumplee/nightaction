@@ -9,6 +9,11 @@ Secure covert communications system with encrypted client-server authentication.
 - **Man-in-the-middle protection**: Public key cryptography prevents packet decryption
 - **Secure session management**: Unique session keys per connection
 - **Codename-based authentication**: 4-word authentication codes like "Pen Clock Door Fire"
+- **Bidirectional communication**: Full two-way encrypted messaging between server and clients
+- **Multi-agent support**: Server handles multiple simultaneous connections
+- **Agent selection UI**: Choose which agent to communicate with in real-time
+- **Session-based chat history**: View full conversation logs while connected
+- **Auto-purge on disconnect**: All chat history permanently deleted when client disconnects ("burn after reading")
 
 ## Security Architecture
 
@@ -139,13 +144,43 @@ Word 4: FIRE
 ╚═══════════════════════════════════════════╝
 Type your messages below. Type 'DISCONNECT' to exit.
 
-[OSPREY]> Hello
-[SERVER]: Server received: Hello
-
+[OSPREY]> Status report
+[SERVER]: All systems operational
 [OSPREY]> DISCONNECT
 [SERVER]: Goodbye OSPREY. Stay safe.
 [*] Connection closed
 ```
+
+## Server Multi-Agent Operation
+
+The server supports simultaneous communication with multiple agents:
+
+```
+SERVER> list
+======================================================================
+#    CODENAME        IP ADDRESS           CONNECTED
+======================================================================
+    1    OSPREY          192.168.1.50         0:05:23
+    2    FALCON          192.168.1.51         0:02:15
+======================================================================
+
+SERVER> select 1
+======================================================================
+CONVERSATION WITH OSPREY (192.168.1.50)
+======================================================================
+[14:23:15] *** OSPREY connected ***
+[14:23:20] OSPREY: Mission status?
+[14:23:25] YOU: Proceed as planned
+======================================================================
+
+[OSPREY]> Copy that, moving to position
+[OSPREY]> back
+
+SERVER> select 2
+[FALCON]> Support team, status report?
+```
+
+**Security Note:** When an agent disconnects, ALL chat history is immediately purged from memory. This "burn after reading" feature ensures no forensic recovery of conversations.
 
 ## File Structure
 
