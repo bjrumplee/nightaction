@@ -458,20 +458,20 @@ class NightActionServer:
 """)
 
         # Start WebSocket server in a separate thread
-        def run_websocket_server():
-            loop = asyncio.new_event_loop()
-            asyncio.set_event_loop(loop)
-
-            start_server = websockets.serve(
+        async def websocket_server():
+            async with websockets.serve(
                 self.handle_client,
                 self.host,
                 self.port,
                 ping_interval=30,
                 ping_timeout=10
-            )
+            ):
+                await asyncio.Future()  # Run forever
 
-            loop.run_until_complete(start_server)
-            loop.run_forever()
+        def run_websocket_server():
+            loop = asyncio.new_event_loop()
+            asyncio.set_event_loop(loop)
+            loop.run_until_complete(websocket_server())
 
         ws_thread = threading.Thread(target=run_websocket_server, daemon=True)
         ws_thread.start()
